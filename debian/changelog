@@ -1,3 +1,10 @@
+cyrus-sasl2 (99:2.1.25.dfsg1-6.1) unstable; urgency=low
+
+  * Non-maintainer upload.
+  * Support for UGent shared mailboxes.
+
+ -- Rudy Gevaert <Rudy.Gevaert@UGent.be>  Thu, 08 Nov 2012 11:47:26 +0100
+
 cyrus-sasl2 (2.1.25.dfsg1-6) unstable; urgency=low
 
   * Fix failures when the host have broken hostname (Closes: #683555)
