@@ -1,0 +1,177 @@
+diff -urNad trunk~/saslauthd/lak.h trunk/saslauthd/lak.h
+--- trunk~/saslauthd/lak.h	2010-02-22 16:15:36.205452686 +0100
++++ trunk/saslauthd/lak.h	2010-02-22 16:15:36.205452686 +0100
+@@ -58,6 +58,7 @@
+ #define LAK_AUTH_METHOD_BIND 0
+ #define LAK_AUTH_METHOD_CUSTOM 1
+ #define LAK_AUTH_METHOD_FASTBIND 2
++#define LAK_AUTH_METHOD_UGENT 3
+ 
+ #define LAK_GROUP_MATCH_METHOD_ATTR 0
+ #define LAK_GROUP_MATCH_METHOD_FILTER 1
+@@ -84,6 +85,7 @@
+     char   search_base[LAK_DN_LEN];
+     char   filter[LAK_DN_LEN];
+     char   password_attr[LAK_BUF_LEN];
++    char   shared_login_attr[LAK_BUF_LEN];
+     char   group_dn[LAK_DN_LEN];
+     char   group_attr[LAK_BUF_LEN];
+     char   group_filter[LAK_DN_LEN];
+diff -urNad trunk~/saslauthd/lak.c trunk/saslauthd/lak.c
+--- trunk~/saslauthd/lak.c	2010-02-22 16:15:36.205452686 +0100
++++ trunk/saslauthd/lak.c	2010-02-22 16:15:36.205452686 +0100
+@@ -88,6 +88,7 @@
+ static int lak_bind(LAK *, LAK_USER *);
+ static void lak_unbind(LAK *);
+ static int lak_auth_custom(LAK *, const char *, const char *, const char *, const char *);
++static int lak_auth_ugent(LAK *, const char *, const char *, const char *, const char *);
+ static int lak_auth_bind(LAK *, const char *, const char *, const char *, const char *);
+ static int lak_auth_fastbind(LAK *, const char *, const char *, const char *, const char *);
+ static int lak_group_member(LAK *, const char *, const char *, const char *, const char *);
+@@ -109,6 +110,7 @@
+ 	{ LAK_AUTH_METHOD_BIND, lak_auth_bind },
+ 	{ LAK_AUTH_METHOD_CUSTOM, lak_auth_custom },
+ 	{ LAK_AUTH_METHOD_FASTBIND, lak_auth_fastbind },
++	{ LAK_AUTH_METHOD_UGENT, lak_auth_ugent},
+ 	{ -1, NULL }
+ };
+ 
+@@ -201,6 +203,9 @@
+ 		else if (!strcasecmp(key, "ldap_password_attr"))
+ 			strlcpy(conf->password_attr, p, LAK_BUF_LEN);
+ 
++		else if (!strcasecmp(key, "ldap_shared_login_attr"))
++			strlcpy(conf->shared_login_attr, p, LAK_BUF_LEN);
++
+ 		else if (!strcasecmp(key, "ldap_group_dn"))
+ 			strlcpy(conf->group_dn, p, LAK_DN_LEN);
+ 		
+@@ -234,6 +239,8 @@
+ 				conf->auth_method = LAK_AUTH_METHOD_CUSTOM;
+ 			} else if (!strcasecmp(p, "fastbind")) {
+ 				conf->auth_method = LAK_AUTH_METHOD_FASTBIND;
++			} else if (!strcasecmp(p, "ugent")) {
++				conf->auth_method = LAK_AUTH_METHOD_UGENT;
+ 			}
+ 		} else if (!strcasecmp(key, "ldap_timeout")) {
+ 			conf->timeout.tv_sec = lak_config_int(p);
+@@ -375,6 +382,7 @@
+ 	conf->version = LDAP_VERSION3;
+ 	strlcpy(conf->filter, "(uid=%u)", LAK_DN_LEN);
+ 	strlcpy(conf->password_attr, "userPassword", LAK_BUF_LEN);
++	strlcpy(conf->shared_login_attr, "umSharedLogin", LAK_BUF_LEN);
+ 	conf->scope = LDAP_SCOPE_SUBTREE;
+ 	strlcpy(conf->group_attr, "uniqueMember", LAK_BUF_LEN);
+ 	conf->group_scope = LDAP_SCOPE_SUBTREE;
+@@ -1271,6 +1279,55 @@
+ 	return rc;
+ }
+ 
++/*
++ * lak_pwcheck_shared_logins- For an object check his shared logins
++ */
++int lak_pwcheck_shared_logins(
++	LAK *lak,
++	const char *user,
++	const char *service,
++	const char *realm,
++	const char *password) 
++{
++	int rc;
++	LAK_RESULT *lres;
++	const char *attrs[] = { lak->conf->shared_login_attr, NULL};
++
++	rc = lak_retrieve(lak, user, service, realm, attrs, &lres);
++
++	if (rc == LAK_OK){
++		const char *attrs_pwh[] = { lak->conf->password_attr, NULL};
++		LAK_RESULT *ptr = lres;
++		int counter = 1;
++		while(ptr!=0){
++			LAK_RESULT *lres_tmp;
++			rc = lak_retrieve(lak, ptr->value, service, realm, attrs_pwh, &lres_tmp);
++			if (rc == LAK_OK){
++				rc = lak_check_password(lres_tmp->value, password, NULL);
++				lak_result_free(lres_tmp);
++				syslog(LOG_DEBUG|LOG_AUTH, "(%s) (%s): %s", user, ptr->value, lak_error(rc));
++
++				if (rc == LAK_OK){
++					lak_result_free(lres);
++					return(rc);
++				}
++			}else{
++				lak_result_free(lres_tmp);
++				syslog(LOG_DEBUG|LOG_AUTH, "(%s) (%s): %s", user, ptr->value, lak_error(rc));
++			}
++			ptr = ptr->next;
++			counter++;
++		}
++		lak_result_free(lres);
++		return(LAK_INVALID_PASSWORD);
++	}else{
++		syslog(LOG_DEBUG|LOG_AUTH, "Error while getting shared logins: (%s)", lak_error(rc));
++		lak_result_free(lres);
++		return(rc);
++	}
++}
++
++
+ static int lak_group_member(
+ 	LAK *lak, 
+ 	const char *user, 
+@@ -1411,6 +1468,55 @@
+ 	return(rc);
+ }
+ 
++/*
++ * First check the hash(es) of user that logs in.
++ * If that doesn't work, we see look for the shared login attributes and
++ * try to log in with their hash ( lak_pwcheck_shared_logins function)
++ */
++static int lak_auth_ugent(
++	LAK *lak,
++	const char *user,
++	const char *service,
++	const char *realm,
++	const char *password) 
++{
++	LAK_RESULT *lres;
++	int counter;
++	int rc;
++
++	const char *attrs[] = { lak->conf->password_attr, NULL};
++	rc = lak_retrieve(lak, user, service, realm, attrs, &lres);
++	switch (rc) {
++        	case LAK_FAIL:
++			syslog(LOG_DEBUG|LOG_AUTH, "(%s) has no %s attributes", user, attrs[0]);
++			lak_result_free(lres);
++			rc = lak_pwcheck_shared_logins(lak, user, service, realm, password);
++			break;
++		case LAK_OK:
++			syslog(LOG_DEBUG|LOG_AUTH, "Checking %s attributes for (%s)", attrs[0], user);
++			LAK_RESULT *ptr = lres;
++			counter = 1;        
++
++			while(ptr!=0){
++				rc = lak_check_password(ptr->value, password, NULL);
++				syslog(LOG_DEBUG|LOG_AUTH, "(%s) (%s) (%s)", user, ptr->attribute, lak_error(rc));
++				if ( rc == LAK_OK ){
++					goto done;
++				}else{
++					ptr = ptr->next;
++				}
++				counter++;
++			}
++			rc = lak_pwcheck_shared_logins(lak, user, service, realm, password);
++			break;
++        	default:
++			goto done;
++	}
++	done:;
++		lak_result_free(lres);
++		return(rc);
++}
++
+ static int lak_auth_bind(
+ 	LAK *lak,
+ 	const char *user,
